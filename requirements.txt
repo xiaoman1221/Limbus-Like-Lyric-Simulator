@@ -2,3 +2,6 @@ PyQt5
 requests
 psutil
 pywin32
+winrt-Windows.Media.Control
+winrt-Windows.Foundation
+pyinstaller

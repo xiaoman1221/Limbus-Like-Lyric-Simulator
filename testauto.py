@@ -14,17 +14,27 @@ import win32process
 import win32api
 import win32con
 from PyQt5.QtWidgets import (
-    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
+    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QGroupBox,
     QTextEdit, QPushButton, QLabel, QSlider, QColorDialog, QSpinBox,
     QFontComboBox, QComboBox, QCheckBox, QInputDialog, QMessageBox,
     QDoubleSpinBox, QScrollArea
 )
-from PyQt5.QtCore import Qt, QTimer, QRectF
+from PyQt5.QtCore import Qt, QTimer, QRectF, QThread, pyqtSignal
 from PyQt5.QtGui import (
     QPainter, QColor, QFont, QFontMetrics, QPen, QPainterPath, QTransform
 )
 
-CONFIG_FILE = "lyric_config.json"
+# ==================== 打包(冻结)模式适配 ====================
+if getattr(sys, 'frozen', False):
+    # 无控制台模式下重定向 stdout/stderr，避免 print 崩溃
+    if sys.stdout is None:
+        sys.stdout = open(os.devnull, 'w', encoding='utf-8')
+    if sys.stderr is None:
+        sys.stderr = open(os.devnull, 'w', encoding='utf-8')
+    BASE_DIR = os.path.dirname(os.path.abspath(sys.executable))
+else:
+    BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+CONFIG_FILE = os.path.join(BASE_DIR, "lyric_config.json")
 
 # ==================== 默认播放器配置 ====================
 DEFAULT_PLAYERS = {
@@ -41,6 +51,105 @@ DEFAULT_PLAYERS = {
         "pattern": r'^(.+)\s*-\s*(.+?)$'
     }
 }
+
+# ==================== SMTC 系统媒体支持 ====================
+SMTC_PLAYER_NAME = "系统媒体 (SMTC)"
+try:
+    import asyncio
+    from winrt.windows.media.control import (
+        GlobalSystemMediaTransportControlsSessionManager as _SmtcManager,
+        GlobalSystemMediaTransportControlsSessionPlaybackStatus as _SmtcPlaybackStatus,
+    )
+    SMTC_AVAILABLE = True
+except Exception:
+    SMTC_AVAILABLE = False
+
+
+def smtc_read_once():
+    """读取一次系统媒体(SMTC)当前会话，返回 dict 或 None。"""
+    if not SMTC_AVAILABLE:
+        return None
+    try:
+        async def _read():
+            mgr = await _SmtcManager.request_async()
+            sess = mgr.get_current_session()
+            if sess is None:
+                return None
+            info = await sess.try_get_media_properties_async()
+            if info is None:
+                return None
+            tl = sess.get_timeline_properties()
+            pb = sess.get_playback_info()
+            position_ms = int(tl.position.total_seconds() * 1000) if tl.position else 0
+            duration_ms = int(tl.end_time.total_seconds() * 1000) if tl.end_time else 0
+            status = pb.playback_status
+            return {
+                "title": (info.title or "").strip(),
+                "artist": (info.artist or "").strip(),
+                "album": (info.album_title or "").strip(),
+                "position_ms": max(0, position_ms),
+                "duration_ms": max(0, duration_ms),
+                "playing": status == _SmtcPlaybackStatus.PLAYING,
+                "paused": status == _SmtcPlaybackStatus.PAUSED,
+                "status": int(status),
+            }
+        return asyncio.run(_read())
+    except Exception as e:
+        print(f"SMTC 读取失败: {e}")
+        return None
+
+
+class SmtcMonitor(QThread):
+    """后台轮询 SMTC：检测切歌并同步播放状态。"""
+    song_changed = pyqtSignal(object)
+    state_updated = pyqtSignal(object)
+    POLL_INTERVAL = 1.0
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._running = True
+        self._last_key = None
+
+    def stop(self):
+        self._running = False
+        self.wait(3000)
+
+    def run(self):
+        if SMTC_AVAILABLE:
+            try:
+                from winrt.runtime import ApartmentType, init_apartment
+                init_apartment(ApartmentType.MTA)
+            except Exception:
+                pass
+        stall = 0
+        last_pos = -1
+        while self._running:
+            media = smtc_read_once()
+            if self._running and media:
+                key = (media["title"], media["artist"], media["album"])
+                playing = media["playing"]
+                pos = media["position_ms"]
+                dur = media["duration_ms"]
+                # 播放中位置一直不前进（如恒为 0）或完全没有时间轴信息 → 时间轴不可靠
+                if playing and pos == last_pos:
+                    stall += 1
+                else:
+                    stall = 0
+                last_pos = pos
+                media["timeline_ok"] = not ((pos == 0 and dur == 0) or (playing and stall >= 2 and pos == 0))
+                if key != self._last_key:
+                    self._last_key = key
+                    stall = 0
+                    last_pos = -1
+                    self.song_changed.emit(media)
+                else:
+                    self.state_updated.emit(media)
+            elif self._running:
+                self._last_key = None
+            for _ in range(int(self.POLL_INTERVAL * 10)):
+                if not self._running:
+                    break
+                time.sleep(0.1)
 
 # ==================== 歌词搜索引擎 ====================
 class LyricSearchEngine:
@@ -192,12 +301,20 @@ class LyricFetcher:
         player_name = panel.player_combo.currentText()
         players = panel.players
         print(f"DEBUG: 播放器={player_name}, 配置={players.get(player_name)}")
-        pid = LyricFetcher.get_player_pid(player_name, players)
-        print(f"DEBUG: PID={pid}")
+        smtc_media = None
         song = None
         artist = None
-        if pid:
-            song, artist = LyricFetcher.get_song_from_title(pid, player_name, players)
+        if player_name == SMTC_PLAYER_NAME:
+            smtc_media = smtc_read_once()
+            if smtc_media and smtc_media["title"]:
+                song = smtc_media["title"]
+                artist = smtc_media["artist"]
+                print(f"DEBUG: SMTC 歌曲={song} 歌手={artist} 位置={smtc_media['position_ms']}ms")
+        else:
+            pid = LyricFetcher.get_player_pid(player_name, players)
+            print(f"DEBUG: PID={pid}")
+            if pid:
+                song, artist = LyricFetcher.get_song_from_title(pid, player_name, players)
         if not song:
             text, ok = QInputDialog.getText(
                 panel, "手动输入",
@@ -221,10 +338,14 @@ class LyricFetcher:
         lyric, duration = LyricSearchEngine.search(song, artist, source, trans_only)
         if lyric:
             panel.text_input.setPlainText(lyric)
-            panel.lyric_window.song_duration = duration
+            panel.lyric_window.song_duration = (smtc_media["duration_ms"] if smtc_media and smtc_media["duration_ms"] else duration)
             panel.status.setText(f"状态：已获取「{song}」的歌词 ")
-            if panel.auto_switch_check.isChecked():
-                panel.start()
+            if panel.auto_switch_check.isChecked() or (smtc_media and panel.smtc_sync_check.isChecked()):
+                panel.start(ignore_delay=bool(smtc_media))
+                if smtc_media:
+                    panel.lyric_window.sync_position(
+                        smtc_media["position_ms"], smtc_media["playing"],
+                        smtc_media["duration_ms"], smtc_media.get("timeline_ok", True))
 
 # ==================== 默认预设 ====================
 DEFAULT_PRESETS = {
@@ -285,6 +406,7 @@ def save_all_config(panel, presets, players):
             'pos_y_min': panel.pos_y_min_s.value(),
             'pos_y_max': panel.pos_y_max_s.value(),
             'auto_switch': panel.auto_switch_check.isChecked(),
+            'smtc_sync': panel.smtc_sync_check.isChecked(),
         },
         'presets': presets,
         'players': players
@@ -455,7 +577,8 @@ class LyricWindow(QMainWindow):
         self.auto_switch_callback = None    # 回调：通知控制面板获取歌词
         self._skip_seconds = 0              # 新歌词需要跳过的秒数
         self._song_finished = False         # 是否已触发结束等待
-        self._song_end_time = 0             # 歌曲结束的时间点      
+        self._song_end_time = 0             # 歌曲结束的时间点
+        self._ext_paused_elapsed = None     # 外部暂停时的本地进度（恢复/不可靠时间轴用）      
         
 
     def init_char_shakes(self):
@@ -528,6 +651,7 @@ class LyricWindow(QMainWindow):
         self.current_line = 0
         self.char_index = 0
         self.full_text = ""
+        self._ext_paused_elapsed = None
         self.update()
 
         # 根据跳过量调整起始时间
@@ -657,10 +781,62 @@ class LyricWindow(QMainWindow):
         self.update()
 
     def stop_lyric(self):
+        self._ext_paused_elapsed = None
         self.char_timer.stop(); self.shake_timer.stop(); self.line_timer.stop()
         self.full_text = ""; self.char_index = 0
         self.lyric_timeline = []; self.current_line = 0
         self.fading_lines = []; self.char_shakes = []
+        self.update()
+
+    def sync_position(self, position_ms, playing, duration_ms=0, timeline_ok=True):
+        """按外部(SMTC)播放位置与状态同步时间轴；时间轴不可靠时退回本地计时。"""
+        position_ms = max(0, position_ms)
+        if duration_ms and duration_ms > 0:
+            self.song_duration = duration_ms
+        now_ms = time.time() * 1000
+        trusted = timeline_ok and (position_ms > 0 or duration_ms > 0)
+        if trusted:
+            self.start_time = now_ms - position_ms
+            self._ext_paused_elapsed = None
+        if playing:
+            if not trusted and self._ext_paused_elapsed is not None:
+                # 暂停后恢复且无外部进度：从暂停点继续本地计时
+                self.start_time = now_ms - self._ext_paused_elapsed
+                self._ext_paused_elapsed = None
+            if not self.line_timer.isActive():
+                self.line_timer.start(50)
+            if self.full_text and not self.char_timer.isActive() and self.char_index < len(self.full_text):
+                self.char_timer.start(50)
+            if self.full_text and not self.shake_timer.isActive():
+                self.shake_timer.start(self.shake_speed)
+        else:
+            if self._ext_paused_elapsed is None:
+                if trusted:
+                    self._ext_paused_elapsed = position_ms
+                else:
+                    self._ext_paused_elapsed = (now_ms - self.start_time) if self.start_time else 0
+            self.line_timer.stop()
+            self.char_timer.stop()
+            self.shake_timer.stop()
+        if not self.lyric_timeline:
+            return
+        if trusted:
+            # 定位到当前位置对应的行（仅在有可靠外部进度时重排，支持快进/快退/切歌）
+            target = 0
+            for i, (t, _txt) in enumerate(self.lyric_timeline):
+                if t <= position_ms:
+                    target = i
+                else:
+                    break
+            if target != self.current_line:
+                self.current_line = target
+                self.full_text = self.lyric_timeline[target][1] if self.lyric_timeline else ""
+                self.char_index = len(self.full_text)
+                self.init_char_shakes()
+                self.place_randomly()
+                self.char_timer.stop()
+                if playing:
+                    self.shake_timer.start(self.shake_speed)
         self.update()
 
     def paintEvent(self, event):
@@ -714,6 +890,155 @@ class LyricWindow(QMainWindow):
         if event.key() == Qt.Key_Escape: QApplication.quit()
 
 # ==================== 控制面板 ====================
+PANEL_QSS = """
+QWidget#panelBase {
+    background-color: #14161c;
+}
+QScrollArea { background: transparent; border: none; }
+QScrollArea > QWidget > QWidget { background: transparent; }
+QWidget {
+    color: #e8e6e0;
+    font-family: "Microsoft YaHei";
+    font-size: 13px;
+}
+QLabel { color: #cfcdc7; background: transparent; }
+QWidget#header {
+    background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #1b1e27, stop:1 #20232e);
+    border: 1px solid #2a2e3a;
+    border-bottom: 2px solid #d8a523;
+    border-radius: 8px;
+}
+QLabel#appTitle { color: #fffeef; font-size: 22px; font-weight: bold; letter-spacing: 2px; }
+QLabel#appSubtitle { color: #d8a523; font-size: 11px; }
+QGroupBox {
+    background-color: #1a1d26;
+    border: 1px solid #2a2e3a;
+    border-radius: 8px;
+    margin-top: 12px;
+    padding-top: 6px;
+    padding-bottom: 4px;
+}
+QGroupBox::title {
+    subcontrol-origin: margin;
+    left: 12px;
+    padding: 0 6px;
+    color: #d8a523;
+    font-weight: bold;
+    background: transparent;
+}
+QPushButton {
+    background-color: #262b37;
+    color: #e8e6e0;
+    border: 1px solid #333a48;
+    border-radius: 6px;
+    padding: 5px 12px;
+}
+QPushButton:hover { background-color: #2f3645; border-color: #d8a523; }
+QPushButton:pressed { background-color: #1f242f; }
+QPushButton#fetchBtn {
+    background-color: #d8a523;
+    color: #14161c;
+    font-weight: bold;
+    border: none;
+    padding: 9px;
+    border-radius: 7px;
+    font-size: 14px;
+}
+QPushButton#fetchBtn:hover { background-color: #e5b53a; }
+QPushButton#startBtn {
+    background-color: #2e9e5b;
+    color: white;
+    font-weight: bold;
+    border: none;
+    padding: 10px;
+    border-radius: 8px;
+    font-size: 14px;
+}
+QPushButton#startBtn:hover { background-color: #35b569; }
+QPushButton#stopBtn {
+    background-color: #d64545;
+    color: white;
+    font-weight: bold;
+    border: none;
+    padding: 10px;
+    border-radius: 8px;
+    font-size: 14px;
+}
+QPushButton#stopBtn:hover { background-color: #e55656; }
+QPushButton#debugBtn {
+    background-color: #262b37;
+    border: 1px solid #4a5264;
+    border-radius: 8px;
+    padding: 10px 16px;
+}
+QPushButton#debugBtn:hover { border-color: #d8a523; }
+QLineEdit, QTextEdit, QSpinBox, QDoubleSpinBox, QComboBox, QFontComboBox {
+    background-color: #12141a;
+    color: #e8e6e0;
+    border: 1px solid #333a48;
+    border-radius: 6px;
+    padding: 4px 8px;
+    selection-background-color: #d8a523;
+    selection-color: #14161c;
+}
+QTextEdit { padding: 6px; }
+QComboBox::drop-down, QFontComboBox::drop-down { border: none; width: 22px; }
+QComboBox::down-arrow {
+    border-left: 5px solid transparent;
+    border-right: 5px solid transparent;
+    border-top: 6px solid #d8a523;
+    margin-right: 6px;
+}
+QComboBox QAbstractItemView {
+    background-color: #1a1d26;
+    color: #e8e6e0;
+    border: 1px solid #333a48;
+    selection-background-color: #d8a523;
+    selection-color: #14161c;
+}
+QSpinBox::up-button, QDoubleSpinBox::up-button,
+QSpinBox::down-button, QDoubleSpinBox::down-button {
+    background: #262b37; border: none; width: 16px;
+}
+QSpinBox::up-arrow, QDoubleSpinBox::up-arrow {
+    border-left: 4px solid transparent; border-right: 4px solid transparent;
+    border-bottom: 5px solid #d8a523;
+}
+QSpinBox::down-arrow, QDoubleSpinBox::down-arrow {
+    border-left: 4px solid transparent; border-right: 4px solid transparent;
+    border-top: 5px solid #d8a523;
+}
+QCheckBox { spacing: 6px; }
+QCheckBox::indicator {
+    width: 15px; height: 15px;
+    border: 1px solid #4a5264; border-radius: 4px; background: #12141a;
+}
+QCheckBox::indicator:hover { border-color: #d8a523; }
+QCheckBox::indicator:checked { background: #d8a523; border-color: #d8a523; }
+QCheckBox::indicator:disabled { background: #1a1d26; border-color: #333a48; }
+QSlider::groove:horizontal { height: 5px; background: #2a2e3a; border-radius: 3px; }
+QSlider::sub-page:horizontal { background: #d8a523; border-radius: 3px; }
+QSlider::handle:horizontal {
+    width: 14px; height: 14px; margin: -5px 0;
+    background: #d8a523; border-radius: 7px;
+}
+QSlider::handle:horizontal:hover { background: #e5b53a; }
+QScrollBar:vertical { background: transparent; width: 10px; margin: 2px; }
+QScrollBar::handle:vertical { background: #333a48; border-radius: 5px; min-height: 30px; }
+QScrollBar::handle:vertical:hover { background: #d8a523; }
+QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
+QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: transparent; }
+QLabel#statusLabel {
+    background: #12141a;
+    border: 1px solid #2a2e3a;
+    border-radius: 8px;
+    padding: 8px;
+    color: #e8e6e0;
+}
+QLabel#licenseLabel { color: #5a6272; font-size: 11px; }
+"""
+
+
 class ControlPanel(QWidget):
     def on_loop_changed(self, state):
         is_checked = state == Qt.Checked
@@ -740,6 +1065,57 @@ class ControlPanel(QWidget):
         self.text_input.clear()
         self.lyric_window.stop_lyric()
         LyricFetcher.fetch_and_set(self)
+
+    def on_smtc_sync_changed(self, state):
+        is_checked = state == Qt.Checked
+        if is_checked:
+            # SMTC 自动同步取代“自动切换歌曲”
+            self.auto_switch_check.blockSignals(True)
+            self.auto_switch_check.setChecked(False)
+            self.auto_switch_check.blockSignals(False)
+            self.lyric_window.auto_switch_enabled = False
+            if self.smtc_monitor is None:
+                self.smtc_monitor = SmtcMonitor(self)
+                self.smtc_monitor.song_changed.connect(self.on_smtc_song_changed)
+                self.smtc_monitor.state_updated.connect(self.on_smtc_state_updated)
+                self.smtc_monitor.start()
+            self.status.setText("状态：SMTC 自动同步已开启，正在监听媒体播放...")
+        else:
+            if self.smtc_monitor is not None:
+                self.smtc_monitor.stop()
+                self.smtc_monitor = None
+            self.status.setText("状态：SMTC 自动同步已关闭")
+
+    def on_smtc_song_changed(self, media):
+        title = (media or {}).get("title", "")
+        if not title:
+            return
+        self.status.setText(f"状态：SMTC 检测到「{title}」...")
+        QApplication.processEvents()
+        self.text_input.clear()
+        self.lyric_window.stop_lyric()
+        source = self.source_combo.currentText()
+        trans_only = self.trans_check.isChecked()
+        self.status.setText(f"状态：从{source}搜索「{title}」...")
+        QApplication.processEvents()
+        lyric, duration = LyricSearchEngine.search(title, media.get("artist", ""), source, trans_only)
+        if lyric:
+            self.text_input.setPlainText(lyric)
+            self.lyric_window.song_duration = media.get("duration_ms") or duration
+            self.start(ignore_delay=True)
+            self.lyric_window.sync_position(
+                media.get("position_ms", 0), media.get("playing", True),
+                media.get("duration_ms", 0), media.get("timeline_ok", True))
+            self.status.setText(f"状态：已获取并同步「{title}」")
+        else:
+            self.status.setText(f"状态：未找到「{title}」的歌词")
+
+    def on_smtc_state_updated(self, media):
+        if media is None:
+            return
+        self.lyric_window.sync_position(
+            media.get("position_ms", 0), media.get("playing", True),
+            media.get("duration_ms", 0), media.get("timeline_ok", True))
     def debug_info(self):
         w = self.lyric_window
         info = f"""
@@ -764,6 +1140,8 @@ class ControlPanel(QWidget):
         super().__init__()
         self.setWindowTitle("歌词字幕器 - 控制面板")
         self.setWindowFlags(Qt.Window | Qt.WindowStaysOnTopHint)
+        self.setObjectName("panelBase")
+        self.setStyleSheet(PANEL_QSS)
         self.current_color = QColor("#fffeef"); self.current_stroke_color = QColor("#d8a523")
         self.current_glow_color = QColor("#d8a523")
         all_data = load_all_config()
@@ -771,15 +1149,27 @@ class ControlPanel(QWidget):
         settings = all_data['settings']
         self.lyric_window = LyricWindow(); self.lyric_window.show()
         self.lyric_window.auto_switch_callback = self.on_auto_switch
+        self.smtc_monitor = None
         outer_layout = QVBoxLayout(self); outer_layout.setContentsMargins(0, 0, 0, 0)
+        outer_layout.setSpacing(0)
         scroll = QScrollArea(); scroll.setWidgetResizable(True)
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         content = QWidget()
-        layout = QVBoxLayout(content); layout.setSpacing(6)
-        
+        layout = QVBoxLayout(content); layout.setSpacing(8)
+        layout.setContentsMargins(10, 10, 10, 10)
 
+        # ============ 顶部横幅 ============
+        header = QWidget(); header.setObjectName("header")
+        header_layout = QVBoxLayout(header); header_layout.setContentsMargins(14, 12, 14, 12)
+        header_layout.setSpacing(2)
+        title = QLabel("歌词字幕器"); title.setObjectName("appTitle")
+        header_layout.addWidget(title)
+        subtitle = QLabel("Limbus-Like Lyric Simulator · 悬浮歌词渲染 · 支持 SMTC 同步")
+        subtitle.setObjectName("appSubtitle")
+        header_layout.addWidget(subtitle)
+        layout.addWidget(header)
 
-        # 缩放
+        # 界面缩放
         zoom_layout = QHBoxLayout()
         zoom_layout.addWidget(QLabel("界面缩放："))
         self.zoom_slider = QSlider(Qt.Horizontal); self.zoom_slider.setRange(70, 150)
@@ -789,41 +1179,74 @@ class ControlPanel(QWidget):
         zoom_layout.addWidget(self.zoom_slider); zoom_layout.addWidget(self.zoom_label)
         layout.addLayout(zoom_layout)
 
-        # 播放器选择
+        # ============ 媒体与歌词 ============
+        media_box = QGroupBox("媒体与歌词")
+        media_layout = QVBoxLayout(media_box); media_layout.setSpacing(8)
         player_layout = QHBoxLayout()
         player_layout.addWidget(QLabel("播放器："))
         self.player_combo = QComboBox(); self.refresh_player_list()
         player_layout.addWidget(self.player_combo)
-        btn_add_p = QPushButton("+"); btn_add_p.setMaximumWidth(30)
+        btn_add_p = QPushButton("+"); btn_add_p.setMaximumWidth(34)
+        btn_add_p.setToolTip("添加自定义播放器")
         btn_add_p.clicked.connect(self.add_custom_player); player_layout.addWidget(btn_add_p)
-        btn_del_p = QPushButton("-"); btn_del_p.setMaximumWidth(30)
+        btn_del_p = QPushButton("-"); btn_del_p.setMaximumWidth(34)
+        btn_del_p.setToolTip("删除播放器")
         btn_del_p.clicked.connect(self.delete_player); player_layout.addWidget(btn_del_p)
         player_layout.addStretch()
-        layout.addLayout(player_layout)
-
-        # 歌词源选择
+        media_layout.addLayout(player_layout)
         source_layout = QHBoxLayout()
         source_layout.addWidget(QLabel("歌词源："))
         self.source_combo = QComboBox()
         self.source_combo.addItems(["网易云", "QQ音乐", "酷狗"])
         source_layout.addWidget(self.source_combo)
         source_layout.addStretch()
-        layout.addLayout(source_layout)
-
-        layout.addWidget(QLabel("歌词（粘贴LRC格式）："))
+        media_layout.addLayout(source_layout)
+        media_layout.addWidget(QLabel("歌词（粘贴LRC格式）："))
         self.text_input = QTextEdit(); self.text_input.setMinimumHeight(120)
-        layout.addWidget(self.text_input)
-
+        media_layout.addWidget(self.text_input)
         fetch_btn = QPushButton("🎵 从播放器获取当前歌词")
-        fetch_btn.clicked.connect(self.fetch_lyric); layout.addWidget(fetch_btn)
-        # 3D透视开关
-        self.perspective_check = QCheckBox("3D透视(测试)")
-        self.perspective_check.setChecked(True)
+        fetch_btn.setObjectName("fetchBtn")
+        fetch_btn.clicked.connect(self.fetch_lyric); media_layout.addWidget(fetch_btn)
+        layout.addWidget(media_box)
+
+        # ============ 播放选项 ============
+        play_box = QGroupBox("播放选项")
+        play_layout = QVBoxLayout(play_box); play_layout.setSpacing(6)
+        options_row = QHBoxLayout()
+        self.trans_check = QCheckBox("翻译歌词"); self.trans_check.setToolTip("仅支持网易云词源")
+        self.trans_check.setChecked(False)
+        options_row.addWidget(self.trans_check)
+        self.loop_check = QCheckBox("单曲循环"); self.loop_check.setChecked(True)
+        self.loop_check.stateChanged.connect(self.on_loop_changed)
+        options_row.addWidget(self.loop_check)
+        self.auto_switch_check = QCheckBox("自动切换歌曲"); self.auto_switch_check.setChecked(False)
+        self.auto_switch_check.stateChanged.connect(self.on_auto_switch_changed)
+        options_row.addWidget(self.auto_switch_check)
+        options_row.addStretch()
+        play_layout.addLayout(options_row)
+        opts2 = QHBoxLayout()
+        self.smtc_sync_check = QCheckBox("SMTC 自动同步")
+        self.smtc_sync_check.setEnabled(SMTC_AVAILABLE)
+        if not SMTC_AVAILABLE:
+            self.smtc_sync_check.setToolTip("需要安装 winrt-Windows.Media.Control 才能使用 SMTC")
+        self.smtc_sync_check.stateChanged.connect(self.on_smtc_sync_changed)
+        opts2.addWidget(self.smtc_sync_check)
+        delay_layout = QHBoxLayout(); delay_layout.addWidget(QLabel("启动延时："))
+        self.delay_combo = QComboBox()
+        self.delay_combo.addItems(["0s", "1s", "2s", "3s", "5s"])
+        delay_layout.addWidget(self.delay_combo)
+        opts2.addLayout(delay_layout)
+        opts2.addStretch()
+        play_layout.addLayout(opts2)
+        layout.addWidget(play_box)
+
+        # ============ 渲染设置 ============
+        render_box = QGroupBox("渲染设置")
+        render_layout = QVBoxLayout(render_box); render_layout.setSpacing(6)
+        self.perspective_check = QCheckBox("启用 3D 透视"); self.perspective_check.setChecked(True)
         self.perspective_check.stateChanged.connect(
             lambda state: setattr(self.lyric_window, 'perspective_enabled', state == Qt.Checked))
-        layout.addWidget(self.perspective_check)
-
-        # 透视X
+        render_layout.addWidget(self.perspective_check)
         px_layout = QHBoxLayout()
         px_layout.addWidget(QLabel("透视X："))
         self.persp_x_slider = QSlider(Qt.Horizontal)
@@ -835,9 +1258,7 @@ class ControlPanel(QWidget):
                        self.persp_x_label.setText(f"{v/1000000:.6f}")))
         px_layout.addWidget(self.persp_x_slider)
         px_layout.addWidget(self.persp_x_label)
-        layout.addLayout(px_layout)
-
-        # 透视Y
+        render_layout.addLayout(px_layout)
         py_layout = QHBoxLayout()
         py_layout.addWidget(QLabel("透视Y："))
         self.persp_y_slider = QSlider(Qt.Horizontal)
@@ -849,9 +1270,7 @@ class ControlPanel(QWidget):
                        self.persp_y_label.setText(f"{v/100000:.5f}")))
         py_layout.addWidget(self.persp_y_slider)
         py_layout.addWidget(self.persp_y_label)
-        layout.addLayout(py_layout)
-
-        # 水平补偿 
+        render_layout.addLayout(py_layout)
         comp_layout = QHBoxLayout()
         comp_layout.addWidget(QLabel("水平补偿："))
         self.persp_comp_slider = QSlider(Qt.Horizontal)
@@ -863,150 +1282,113 @@ class ControlPanel(QWidget):
                        self.persp_comp_label.setText(f"{v/100:.2f}")))
         comp_layout.addWidget(self.persp_comp_slider)
         comp_layout.addWidget(self.persp_comp_label)
-        layout.addLayout(comp_layout)
-        # 选项行
-        options_row = QHBoxLayout()
-        self.trans_check = QCheckBox("获取翻译歌词(仅支持网易云词源)"); self.trans_check.setChecked(False)
-        options_row.addWidget(self.trans_check)
-        self.loop_check = QCheckBox("单曲循环"); self.loop_check.setChecked(True)
-        self.loop_check.stateChanged.connect(self.on_loop_changed)
-        options_row.addWidget(self.loop_check)
-        self.auto_switch_check = QCheckBox("自动切换歌曲"); self.auto_switch_check.setChecked(False)
-        self.auto_switch_check.stateChanged.connect(self.on_auto_switch_changed)
-        options_row.addWidget(self.auto_switch_check)
-        options_row.addStretch()
-        layout.addLayout(options_row)
-
-        # 启动延时
-        delay_layout = QHBoxLayout()
-        delay_layout.addWidget(QLabel("启动延时："))
-        self.delay_combo = QComboBox()
-        self.delay_combo.addItems(["0s", "1s", "2s", "3s", "5s"])
-        delay_layout.addWidget(self.delay_combo)
-        delay_layout.addStretch()
-        layout.addLayout(delay_layout)
-
-        # 预设 + 模式
-        top_row = QHBoxLayout()
-        top_row.addWidget(QLabel("预设："))
-        self.preset_combo = QComboBox(); self.preset_combo.setMinimumWidth(80)
-        self.refresh_preset_list(); self.preset_combo.currentTextChanged.connect(self.load_preset)
-        top_row.addWidget(self.preset_combo)
-        btn_new = QPushButton("+"); btn_new.setMaximumWidth(30); btn_new.clicked.connect(self.new_preset)
-        top_row.addWidget(btn_new)
-        btn_del = QPushButton("-"); btn_del.setMaximumWidth(30); btn_del.clicked.connect(self.delete_preset)
-        top_row.addWidget(btn_del); top_row.addStretch()
-        top_row.addWidget(QLabel("模式："))
-        self.mode_combo = QComboBox()
-        self.mode_combo.addItem("中文", "chinese"); self.mode_combo.addItem("英文", "english")
-        self.mode_combo.setMaximumWidth(80); top_row.addWidget(self.mode_combo)
-        layout.addLayout(top_row)
-
-        # 发光
-        glow_layout = QHBoxLayout()
-        self.glow_check = QCheckBox("发光"); self.glow_check.setChecked(True)
-        glow_layout.addWidget(self.glow_check)
-        glow_layout.addWidget(QLabel("光色："))
-        self.glow_color_btn = QPushButton(); self.glow_color_btn.setFixedSize(30, 30)
-        self.glow_color_btn.setStyleSheet(f"background-color:{self.current_glow_color.name()};")
-        self.glow_color_btn.clicked.connect(self.pick_glow_color)
-        glow_layout.addWidget(self.glow_color_btn); glow_layout.addStretch()
-        layout.addLayout(glow_layout)
-
-        gsl = QHBoxLayout(); gsl.addWidget(QLabel("光晕粗细："))
-        self.glow_size_slider = QSlider(Qt.Horizontal); self.glow_size_slider.setRange(4, 30)
-        self.glow_size_slider.setValue(4); self.glow_size_label = QLabel("4")
-        self.glow_size_slider.valueChanged.connect(lambda v: self.glow_size_label.setText(str(v)))
-        gsl.addWidget(self.glow_size_slider); gsl.addWidget(self.glow_size_label)
-        layout.addLayout(gsl)
-
-        gal = QHBoxLayout(); gal.addWidget(QLabel("光晕透明度："))
-        self.glow_alpha_slider = QSlider(Qt.Horizontal); self.glow_alpha_slider.setRange(10, 120)
-        self.glow_alpha_slider.setValue(82); self.glow_alpha_label = QLabel("82")
-        self.glow_alpha_slider.valueChanged.connect(lambda v: self.glow_alpha_label.setText(str(v)))
-        gal.addWidget(self.glow_alpha_slider); gal.addWidget(self.glow_alpha_label)
-        layout.addLayout(gal)
-
+        render_layout.addLayout(comp_layout)
         fl = QHBoxLayout(); fl.addWidget(QLabel("字体："))
         self.font_combo = QFontComboBox(); self.font_combo.setCurrentFont(QFont("Microsoft YaHei"))
         fl.addWidget(self.font_combo); fl.addWidget(QLabel("大小："))
         self.font_size = QSpinBox(); self.font_size.setRange(10, 100); self.font_size.setValue(28)
-        fl.addWidget(self.font_size); layout.addLayout(fl)
-                # 推荐字体按钮
+        fl.addWidget(self.font_size); render_layout.addLayout(fl)
         fl_auto = QHBoxLayout()
         btn_auto_font = QPushButton("推荐字体")
         btn_auto_font.clicked.connect(self.auto_select_font)
         fl_auto.addWidget(btn_auto_font)
         fl_auto.addStretch()
-        layout.addLayout(fl_auto)
-
+        render_layout.addLayout(fl_auto)
         cl = QHBoxLayout(); cl.addWidget(QLabel("文字："))
         self.color_btn = QPushButton(); self.color_btn.setFixedSize(30, 30)
-        self.color_btn.setStyleSheet(f"background-color:{self.current_color.name()};")
+        self.color_btn.setObjectName("colorBtn")
+        self.color_btn.setStyleSheet(f"background-color:{self.current_color.name()};border-radius:6px;border:1px solid #4a5264;")
         self.color_btn.clicked.connect(self.pick_color); cl.addWidget(self.color_btn)
         cl.addWidget(QLabel("阴影："))
         self.stroke_btn = QPushButton(); self.stroke_btn.setFixedSize(30, 30)
-        self.stroke_btn.setStyleSheet(f"background-color:{self.current_stroke_color.name()};")
+        self.stroke_btn.setObjectName("colorBtn")
+        self.stroke_btn.setStyleSheet(f"background-color:{self.current_stroke_color.name()};border-radius:6px;border:1px solid #4a5264;")
         self.stroke_btn.clicked.connect(self.pick_stroke); cl.addWidget(self.stroke_btn)
-        cl.addStretch(); layout.addLayout(cl)
-
+        cl.addStretch(); render_layout.addLayout(cl)
         swl = QHBoxLayout(); swl.addWidget(QLabel("描边粗细："))
         self.stroke_spin = QDoubleSpinBox(); self.stroke_spin.setRange(0.0, 10.0)
         self.stroke_spin.setSingleStep(0.1); self.stroke_spin.setDecimals(1); self.stroke_spin.setValue(0.5)
-        swl.addWidget(self.stroke_spin); swl.addWidget(QLabel("px")); layout.addLayout(swl)
-
+        swl.addWidget(self.stroke_spin); swl.addWidget(QLabel("px")); render_layout.addLayout(swl)
         ssl = QHBoxLayout(); ssl.addWidget(QLabel("字间距："))
         self.spacing_spin = QDoubleSpinBox(); self.spacing_spin.setRange(-10.0, 30.0)
         self.spacing_spin.setSingleStep(0.5); self.spacing_spin.setDecimals(1); self.spacing_spin.setValue(5.0)
-        ssl.addWidget(self.spacing_spin); ssl.addWidget(QLabel("px")); layout.addLayout(ssl)
+        ssl.addWidget(self.spacing_spin); ssl.addWidget(QLabel("px")); render_layout.addLayout(ssl)
+        glow_layout = QHBoxLayout()
+        self.glow_check = QCheckBox("发光"); self.glow_check.setChecked(True)
+        glow_layout.addWidget(self.glow_check)
+        glow_layout.addWidget(QLabel("光色："))
+        self.glow_color_btn = QPushButton(); self.glow_color_btn.setFixedSize(30, 30)
+        self.glow_color_btn.setObjectName("colorBtn")
+        self.glow_color_btn.setStyleSheet(f"background-color:{self.current_glow_color.name()};border-radius:6px;border:1px solid #4a5264;")
+        self.glow_color_btn.clicked.connect(self.pick_glow_color)
+        glow_layout.addWidget(self.glow_color_btn); glow_layout.addStretch()
+        render_layout.addLayout(glow_layout)
+        gsl = QHBoxLayout(); gsl.addWidget(QLabel("光晕粗细："))
+        self.glow_size_slider = QSlider(Qt.Horizontal); self.glow_size_slider.setRange(4, 30)
+        self.glow_size_slider.setValue(4); self.glow_size_label = QLabel("4")
+        self.glow_size_slider.valueChanged.connect(lambda v: self.glow_size_label.setText(str(v)))
+        gsl.addWidget(self.glow_size_slider); gsl.addWidget(self.glow_size_label)
+        render_layout.addLayout(gsl)
+        gal = QHBoxLayout(); gal.addWidget(QLabel("光晕透明度："))
+        self.glow_alpha_slider = QSlider(Qt.Horizontal); self.glow_alpha_slider.setRange(10, 120)
+        self.glow_alpha_slider.setValue(82); self.glow_alpha_label = QLabel("82")
+        self.glow_alpha_slider.valueChanged.connect(lambda v: self.glow_alpha_label.setText(str(v)))
+        gal.addWidget(self.glow_alpha_slider); gal.addWidget(self.glow_alpha_label)
+        render_layout.addLayout(gal)
+        layout.addWidget(render_box)
 
+        # ============ 动态效果 ============
+        fx_box = QGroupBox("动态效果")
+        fx_layout = QVBoxLayout(fx_box); fx_layout.setSpacing(6)
         shl = QHBoxLayout(); shl.addWidget(QLabel("颤强："))
         self.shake_intensity_slider = QSlider(Qt.Horizontal); self.shake_intensity_slider.setRange(0, 10)
         self.shake_intensity_slider.setValue(2); self.shake_intensity_label = QLabel("2")
         self.shake_intensity_slider.valueChanged.connect(lambda v: self.shake_intensity_label.setText(str(v)))
         shl.addWidget(self.shake_intensity_slider); shl.addWidget(self.shake_intensity_label)
-        layout.addLayout(shl)
-
+        fx_layout.addLayout(shl)
         shvl = QHBoxLayout(); shvl.addWidget(QLabel("颤速："))
         self.shake_speed_slider = QSlider(Qt.Horizontal); self.shake_speed_slider.setRange(10, 200)
         self.shake_speed_slider.setValue(143); self.shake_speed_label = QLabel("143 ms")
         self.shake_speed_slider.valueChanged.connect(lambda v: self.shake_speed_label.setText(f"{v} ms"))
         shvl.addWidget(self.shake_speed_slider); shvl.addWidget(self.shake_speed_label)
-        layout.addLayout(shvl)
-
+        fx_layout.addLayout(shvl)
         fsl = QHBoxLayout(); fsl.addWidget(QLabel("淡出速度："))
         self.fade_speed_slider = QSlider(Qt.Horizontal); self.fade_speed_slider.setRange(1, 15)
         self.fade_speed_slider.setValue(12); self.fade_speed_label = QLabel("12")
         self.fade_speed_slider.valueChanged.connect(lambda v: self.fade_speed_label.setText(str(v)))
         fsl.addWidget(self.fade_speed_slider); fsl.addWidget(self.fade_speed_label)
-        layout.addLayout(fsl)
-
+        fx_layout.addLayout(fsl)
         rsl = QHBoxLayout(); rsl.addWidget(QLabel("上升速度："))
         self.rise_speed_slider = QSlider(Qt.Horizontal); self.rise_speed_slider.setRange(0, 5)
         self.rise_speed_slider.setValue(1); self.rise_speed_label = QLabel("1")
         self.rise_speed_slider.valueChanged.connect(lambda v: self.rise_speed_label.setText(str(v)))
         rsl.addWidget(self.rise_speed_slider); rsl.addWidget(self.rise_speed_label)
-        layout.addLayout(rsl)
-
+        fx_layout.addLayout(rsl)
         ml = QHBoxLayout(); ml.addWidget(QLabel("留白："))
         self.margin_spin = QSpinBox(); self.margin_spin.setRange(0, 5000)
         self.margin_spin.setValue(4000); self.margin_spin.setSingleStep(100)
         ml.addWidget(self.margin_spin); ml.addWidget(QLabel("ms")); ml.addStretch()
-        layout.addLayout(ml)
-
-        mil = QHBoxLayout(); mil.addWidget(QLabel("长间隔阈值："))
-        self.max_interval_spin = QSpinBox(); self.max_interval_spin.setRange(1000, 30000)
-        self.max_interval_spin.setValue(16000); self.max_interval_spin.setSingleStep(1000)
-        mil.addWidget(self.max_interval_spin); mil.addWidget(QLabel("ms")); mil.addStretch()
-        layout.addLayout(mil)
-
-        mdl = QHBoxLayout(); mdl.addWidget(QLabel("长间隔时长："))
-        self.max_duration_spin = QSpinBox(); self.max_duration_spin.setRange(500, 10000)
+        fx_layout.addLayout(ml)
+        mxl = QHBoxLayout(); mxl.addWidget(QLabel("最大间隔："))
+        self.max_interval_spin = QSpinBox(); self.max_interval_spin.setRange(1000, 60000)
+        self.max_interval_spin.setValue(16000); self.max_interval_spin.setSingleStep(500)
+        mxl.addWidget(self.max_interval_spin); mxl.addWidget(QLabel("ms")); mxl.addStretch()
+        fx_layout.addLayout(mxl)
+        mdl = QHBoxLayout(); mdl.addWidget(QLabel("最大时长："))
+        self.max_duration_spin = QSpinBox(); self.max_duration_spin.setRange(500, 30000)
         self.max_duration_spin.setValue(5000); self.max_duration_spin.setSingleStep(500)
         mdl.addWidget(self.max_duration_spin); mdl.addWidget(QLabel("ms")); mdl.addStretch()
-        layout.addLayout(mdl)
+        fx_layout.addLayout(mdl)
+        al = QHBoxLayout(); al.addWidget(QLabel("角度："))
+        self.angle_min = QSpinBox(); self.angle_min.setRange(-90, 90); self.angle_min.setValue(-10)
+        al.addWidget(self.angle_min); al.addWidget(QLabel("~"))
+        self.angle_max = QSpinBox(); self.angle_max.setRange(-90, 90); self.angle_max.setValue(10)
+        al.addWidget(self.angle_max); al.addStretch(); fx_layout.addLayout(al)
+        layout.addWidget(fx_box)
 
-        # 起始位置范围v1.3
+        # ============ 位置 ============
+        pos_box = QGroupBox("歌词位置")
+        pos_layout2 = QVBoxLayout(pos_box); pos_layout2.setSpacing(6)
         pos_layout = QHBoxLayout()
         pos_layout.addWidget(QLabel("X范围："))
         self.pos_x_min_s = QSlider(Qt.Horizontal)
@@ -1020,8 +1402,7 @@ class ControlPanel(QWidget):
         self.pos_x_max_lbl = QLabel("85%")
         self.pos_x_max_s.valueChanged.connect(lambda v: (setattr(self.lyric_window, 'pos_x_max', v), self.pos_x_max_lbl.setText(f"{v}%")))
         pos_layout.addWidget(self.pos_x_max_s); pos_layout.addWidget(self.pos_x_max_lbl)
-        layout.addLayout(pos_layout)
-
+        pos_layout2.addLayout(pos_layout)
         pos_y_layout = QHBoxLayout()
         pos_y_layout.addWidget(QLabel("Y范围："))
         self.pos_y_min_s = QSlider(Qt.Horizontal)
@@ -1035,35 +1416,63 @@ class ControlPanel(QWidget):
         self.pos_y_max_lbl = QLabel("75%")
         self.pos_y_max_s.valueChanged.connect(lambda v: (setattr(self.lyric_window, 'pos_y_max', v), self.pos_y_max_lbl.setText(f"{v}%")))
         pos_y_layout.addWidget(self.pos_y_max_s); pos_y_layout.addWidget(self.pos_y_max_lbl)
-        layout.addLayout(pos_y_layout)
+        pos_layout2.addLayout(pos_y_layout)
+        layout.addWidget(pos_box)
 
-        al = QHBoxLayout(); al.addWidget(QLabel("角度："))
-        self.angle_min = QSpinBox(); self.angle_min.setRange(-90, 90); self.angle_min.setValue(-10)
-        al.addWidget(self.angle_min); al.addWidget(QLabel("~"))
-        self.angle_max = QSpinBox(); self.angle_max.setRange(-90, 90); self.angle_max.setValue(10)
-        al.addWidget(self.angle_max); al.addStretch(); layout.addLayout(al)
+        # ============ 预设与模式 ============
+        preset_box = QGroupBox("预设与模式")
+        preset_layout = QVBoxLayout(preset_box); preset_layout.setSpacing(6)
+        top_row = QHBoxLayout()
+        top_row.addWidget(QLabel("预设："))
+        self.preset_combo = QComboBox(); self.preset_combo.setMinimumWidth(120)
+        self.refresh_preset_list(); self.preset_combo.currentTextChanged.connect(self.load_preset)
+        top_row.addWidget(self.preset_combo)
+        btn_new = QPushButton("+"); btn_new.setMaximumWidth(34); btn_new.setToolTip("新建预设")
+        btn_new.clicked.connect(self.new_preset)
+        top_row.addWidget(btn_new)
+        btn_del = QPushButton("-"); btn_del.setMaximumWidth(34); btn_del.setToolTip("删除预设")
+        btn_del.clicked.connect(self.delete_preset)
+        top_row.addWidget(btn_del)
+        top_row.addStretch()
+        preset_layout.addLayout(top_row)
+        mode_row = QHBoxLayout()
+        mode_row.addWidget(QLabel("模式："))
+        self.mode_combo = QComboBox()
+        self.mode_combo.addItem("中文", "chinese"); self.mode_combo.addItem("英文", "english")
+        self.mode_combo.setMaximumWidth(120); mode_row.addWidget(self.mode_combo)
+        mode_row.addStretch()
+        preset_layout.addLayout(mode_row)
+        layout.addWidget(preset_box)
 
-        bl = QHBoxLayout()
-        self.start_btn = QPushButton("开始"); self.start_btn.clicked.connect(self.start)
-        self.start_btn.setStyleSheet("background:#4CAF50;color:white;padding:10px;font-size:14px;")
+        # ============ 播放控制 ============
+        ctrl_box = QGroupBox("播放控制")
+        ctrl_layout = QVBoxLayout(ctrl_box); ctrl_layout.setSpacing(8)
+        bl = QHBoxLayout(); bl.setSpacing(10)
+        self.start_btn = QPushButton("▶ 开始"); self.start_btn.clicked.connect(self.start)
+        self.start_btn.setObjectName("startBtn")
         bl.addWidget(self.start_btn)
-        self.stop_btn = QPushButton("停止"); self.stop_btn.clicked.connect(self.stop)
-        self.stop_btn.setStyleSheet("background:#f44336;color:white;padding:10px;font-size:14px;")
-        bl.addWidget(self.stop_btn); 
+        self.stop_btn = QPushButton("■ 停止"); self.stop_btn.clicked.connect(self.stop)
+        self.stop_btn.setObjectName("stopBtn")
+        bl.addWidget(self.stop_btn)
         self.debug_btn = QPushButton("Debug"); self.debug_btn.clicked.connect(self.debug_info)
+        self.debug_btn.setObjectName("debugBtn")
         bl.addWidget(self.debug_btn)
-        layout.addLayout(bl)
-
+        bl.addStretch()
+        ctrl_layout.addLayout(bl)
         self.status = QLabel("状态：就绪"); self.status.setAlignment(Qt.AlignCenter)
-        self.status.setMaximumWidth(450)
-        layout.addWidget(self.status)
-        layout.addWidget(QLabel("MIT License"))
+        self.status.setObjectName("statusLabel")
+        ctrl_layout.addWidget(self.status)
+        layout.addWidget(ctrl_box)
+
+        license_lbl = QLabel("MIT License"); license_lbl.setObjectName("licenseLabel")
+        license_lbl.setAlignment(Qt.AlignCenter)
+        layout.addWidget(license_lbl)
 
         scroll.setWidget(content); outer_layout.addWidget(scroll)
 
         screen = QApplication.primaryScreen().geometry()
         screen_h = screen.height()
-        self.setFixedSize(500, 700) if screen_h <= 1080 else self.setFixedSize(520, 900)
+        self.setFixedSize(560, 720) if screen_h <= 1080 else self.setFixedSize(580, 920)
 
         
 
@@ -1109,16 +1518,19 @@ class ControlPanel(QWidget):
                 if idx >= 0: self.source_combo.setCurrentIndex(idx)
                 delay_idx = settings.get('delay', 0)
                 self.delay_combo.setCurrentIndex(delay_idx)
-                self.color_btn.setStyleSheet(f"background-color:{self.current_color.name()};")
-                self.stroke_btn.setStyleSheet(f"background-color:{self.current_stroke_color.name()};")
-                self.glow_color_btn.setStyleSheet(f"background-color:{self.current_glow_color.name()};")
+                self.color_btn.setStyleSheet(f"background-color:{self.current_color.name()};border-radius:6px;border:1px solid #4a5264;")
+                self.stroke_btn.setStyleSheet(f"background-color:{self.current_stroke_color.name()};border-radius:6px;border:1px solid #4a5264;")
+                self.glow_color_btn.setStyleSheet(f"background-color:{self.current_glow_color.name()};border-radius:6px;border:1px solid #4a5264;")
                 self.auto_switch_check.setChecked(settings.get('auto_switch', False))
+                self.smtc_sync_check.setChecked(settings.get('smtc_sync', False))
             except: pass
         
 
     def refresh_player_list(self):
         self.player_combo.blockSignals(True); self.player_combo.clear()
         self.player_combo.addItems(list(self.players.keys()))
+        if SMTC_AVAILABLE:
+            self.player_combo.addItem(SMTC_PLAYER_NAME)
         self.player_combo.blockSignals(False)
 
     def add_custom_player(self):
@@ -1165,8 +1577,9 @@ class ControlPanel(QWidget):
     def apply_zoom(self):
         scale = self.zoom_slider.value() / 100.0
         screen = QApplication.primaryScreen().geometry()
-        base_h = 700 if screen.height() <= 1080 else 900
-        self.setFixedSize(int(500 * scale), int(base_h * scale))
+        base_w = 560 if screen.height() <= 1080 else 580
+        base_h = 720 if screen.height() <= 1080 else 920
+        self.setFixedSize(int(base_w * scale), int(base_h * scale))
 
     def fetch_lyric(self): LyricFetcher.fetch_and_set(self)
 
@@ -1194,7 +1607,7 @@ class ControlPanel(QWidget):
 
     def pick_glow_color(self):
         c = QColorDialog.getColor(self.current_glow_color, self, "发光颜色")
-        if c.isValid(): self.current_glow_color = c; self.glow_color_btn.setStyleSheet(f"background-color:{c.name()};")
+        if c.isValid(): self.current_glow_color = c; self.glow_color_btn.setStyleSheet(f"background-color:{c.name()};border-radius:6px;border:1px solid #4a5264;")
 
     def load_preset(self, name):
         if name in self.presets:
@@ -1224,19 +1637,19 @@ class ControlPanel(QWidget):
         self.status.setText(f"状态：已切换字体 {chosen}")
     def pick_color(self):
         c = QColorDialog.getColor(self.current_color, self, "文字颜色")
-        if c.isValid(): self.current_color = c; self.color_btn.setStyleSheet(f"background-color:{c.name()};")
+        if c.isValid(): self.current_color = c; self.color_btn.setStyleSheet(f"background-color:{c.name()};border-radius:6px;border:1px solid #4a5264;")
 
     def pick_stroke(self):
         c = QColorDialog.getColor(self.current_stroke_color, self, "阴影/描边颜色")
-        if c.isValid(): self.current_stroke_color = c; self.stroke_btn.setStyleSheet(f"background-color:{c.name()};")
+        if c.isValid(): self.current_stroke_color = c; self.stroke_btn.setStyleSheet(f"background-color:{c.name()};border-radius:6px;border:1px solid #4a5264;")
 
-    def start(self):
+    def start(self, ignore_delay=False):
         text = self.text_input.toPlainText().strip()
         if not text: self.status.setText("状态：请先输入歌词！"); return
         font = QFont(self.font_combo.currentFont().family(), self.font_size.value(), QFont.Bold)
         mode = self.mode_combo.currentData()
         self.lyric_window.loop = self.loop_check.isChecked()
-        delay = int(self.delay_combo.currentText().replace('s', ''))
+        delay = 0 if ignore_delay else int(self.delay_combo.currentText().replace('s', ''))
         self.lyric_window.start_lyric(
             text, font, self.current_color, self.current_stroke_color,
             self.stroke_spin.value(), self.angle_min.value(), self.angle_max.value(),
@@ -1251,6 +1664,9 @@ class ControlPanel(QWidget):
 
     def stop(self): self.lyric_window.stop_lyric(); self.status.setText("状态：已停止")
     def closeEvent(self, event):
+        if self.smtc_monitor is not None:
+            self.smtc_monitor.stop()
+            self.smtc_monitor = None
         save_all_config(self, self.presets, self.players)
         self.lyric_window.close(); event.accept()
 
